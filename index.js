@@ -30,9 +30,11 @@ const PLANS = {
 };
 
 // ---------- Database ----------
-fs.mkdirSync(path.join(__dirname, 'data'), { recursive: true });
-fs.mkdirSync(path.join(__dirname, 'uploads'), { recursive: true });
-const db = new Database(path.join(__dirname, 'data', 'sba.db'));
+const DATA_DIR = env.DATA_DIR || path.join(__dirname, 'data');          // set DATA_DIR to a persistent volume in production
+const UPLOADS_DIR = env.UPLOADS_DIR || path.join(__dirname, 'uploads');
+fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+const db = new Database(path.join(DATA_DIR, 'sba.db'));
 db.pragma('journal_mode = WAL');
 db.exec(SCHEMA);
 try { db.exec("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'owner'"); } catch { /* column already exists */ }
@@ -48,20 +50,16 @@ if (env.ADMIN_EMAIL && env.ADMIN_PASSWORD) {
 const app = express();
 app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: { policy: 'cross-origin' } }));
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
-  allowedHeaders: '*',
-}));
+app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: false }));
-app.use('/uploads', express.static(path.join(__dirname, 'uploads'), { maxAge: '7d' }));
+app.use('/uploads', express.static(UPLOADS_DIR, { maxAge: '7d' }));
 
 const limiter = (max) => rateLimit({ windowMs: 15 * 60 * 1000, max, standardHeaders: true, legacyHeaders: false });
 
 const upload = multer({
   storage: multer.diskStorage({
-    destination: path.join(__dirname, 'uploads'),
+    destination: UPLOADS_DIR,
     filename: (_req, file, cb) =>
       cb(null, crypto.randomBytes(12).toString('hex') + path.extname(file.originalname).toLowerCase()),
   }),
@@ -290,11 +288,19 @@ registerAdmin(app, ctx);
 registerCalls(app, ctx);
 
 // ---------- Serve the built React app in production ----------
+app.get(['/health', '/api/health'], (_req, res) => res.json({ ok: true }));
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found.' }));
-const dist = path.join(__dirname, '../client/dist');
-if (fs.existsSync(dist)) {
+
+// Find the built React site: CLIENT_DIST, ./public, ./client/dist or ../client/dist
+const dist = [env.CLIENT_DIST, path.join(__dirname, 'public'), path.join(__dirname, 'client/dist'), path.join(__dirname, '../client/dist')]
+  .filter(Boolean).find((d) => fs.existsSync(path.join(d, 'index.html')));
+if (dist) {
+  console.log('Serving website from', dist);
   app.use(express.static(dist));
   app.get('*', (_req, res) => res.sendFile(path.join(dist, 'index.html')));
+} else {
+  console.warn('Website build not found. Copy client/dist to server/public.');
+  app.get('/', (_req, res) => res.type('text').send('SellBuyAnywhere API is running. The website build was not found: copy client/dist into server/public and redeploy.'));
 }
 
 app.use((err, _req, res, _next) => {
@@ -302,5 +308,5 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: 'Something went wrong on our side. Try again.' });
 });
 
-const server = app.listen(PORT, () => console.log(`SellBuyAnywhere running on http://localhost:${PORT}`));
+const server = app.listen(PORT, '0.0.0.0', () => console.log(`SellBuyAnywhere running on http://localhost:${PORT}`));
 attachVoiceSocket(server, ctx);

@@ -9,15 +9,17 @@ import { fileURLToPath } from 'url';
 import { SCHEMA } from './schema.js';
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
-fs.mkdirSync(path.join(dir, 'data'), { recursive: true });
-fs.mkdirSync(path.join(dir, 'uploads'), { recursive: true });
-const db = new Database(path.join(dir, 'data', 'sba.db'));
+const DATA_DIR = process.env.DATA_DIR || path.join(dir, 'data');
+const UPLOADS_DIR = process.env.UPLOADS_DIR || UPLOADS_DIR;
+fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+const db = new Database(path.join(DATA_DIR, 'sba.db'));
 db.exec(SCHEMA);
 try { db.exec("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'owner'"); } catch { /* already there */ }
 
 if (process.argv.includes('--reset')) {
   db.exec('DELETE FROM products; DELETE FROM shops; DELETE FROM users; DELETE FROM ads; DELETE FROM calls;');
-  for (const f of fs.readdirSync(path.join(dir, 'uploads'))) if (f.startsWith('seed-')) fs.unlinkSync(path.join(dir, 'uploads', f));
+  for (const f of fs.readdirSync(UPLOADS_DIR)) if (f.startsWith('seed-')) fs.unlinkSync(path.join(dir, 'uploads', f));
 }
 if (db.prepare("SELECT 1 FROM users WHERE email LIKE '%@demo.sellbuyanywhere.com'").get()) {
   console.log('Demo data already exists. Use `npm run seed -- --reset` to start over.');
