@@ -1,0 +1,23 @@
+export const SCHEMA = `
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT DEFAULT 'owner',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS shops (
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, name TEXT NOT NULL, city TEXT NOT NULL,
+  phone TEXT NOT NULL, address TEXT DEFAULT '', plan TEXT NOT NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS products (
+  id INTEGER PRIMARY KEY, shop_id INTEGER NOT NULL, title TEXT NOT NULL, description TEXT DEFAULT '',
+  price INTEGER NOT NULL, category TEXT DEFAULT 'Other', city TEXT NOT NULL, image TEXT DEFAULT '',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS pending_shops (
+  order_id TEXT PRIMARY KEY, owner_name TEXT, email TEXT, phone TEXT, shop_name TEXT, city TEXT,
+  address TEXT, plan TEXT, status TEXT DEFAULT 'created');
+CREATE TABLE IF NOT EXISTS ads (
+  id INTEGER PRIMARY KEY, slot TEXT NOT NULL, title TEXT NOT NULL, image TEXT DEFAULT '',
+  link TEXT NOT NULL, active INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS calls (
+  id INTEGER PRIMARY KEY, product_id INTEGER, shop_id INTEGER, phone TEXT NOT NULL, status TEXT DEFAULT 'queued',
+  call_sid TEXT, note TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS idx_products_city ON products(city);
+`;
