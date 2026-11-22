@@ -3,10 +3,10 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
+    "prestart": "npm install --omit=dev",
     "start": "node index.js",
     "dev": "node --watch index.js",
-    "seed": "node seed.js",
-    "build:client": "cd ../client && npm install && npm run build && rm -rf ../server/public && cp -r dist ../server/public"
+    "seed": "node seed.js"
   },
   "engines": {
     "node": ">=18"
