@@ -5,7 +5,7 @@ import Razorpay from 'razorpay';
 import crypto from 'crypto';
 import { db, getSetting, resolvePage } from './db.js';
 import { JWT_SECRET } from './config.js';
-import { aiEnabled, aiSuggestions, aiToEnglish, aiImageToQuery, aiDescribe, aiModerate, aiAsk, aiAssistant, aiShopIntake } from './ai.js';
+import { aiEnabled, aiParseSearch, aiSuggestions, aiToEnglish, aiImageToQuery, aiDescribe, aiModerate, aiAsk, aiAssistant, aiShopIntake } from './ai.js';
 import { wrap, clean, normalizePhone, limiter, sendMail, randomPassword, siteUrl, isEmail, auth, optAuth, signToken, upload, memUpload } from './util.js';
 
 export const PLAN_LABELS = { basic: 'Basic shop', ai: 'Shop + AI chat and recommendations', store: 'Full e-commerce + AI' };
@@ -30,11 +30,13 @@ async function createOrder(kind, rupees, meta, userId = null) {
 const LSEL = `SELECT l.id,l.title,l.description,l.price,l.category,l.city,l.image,l.shop_id,l.user_id,l.status,l.views,l.created_at,l.featured_until,
   COALESCE(l.featured_until > datetime('now'), 0) AS featured, s.name AS shop_name FROM listings l LEFT JOIN shops s ON s.id = l.shop_id`;
 
-function findListings({ q = '', terms = [], city = '', category = '', shop = '', limit = 24, offset = 0 }) {
+function findListings({ q = '', terms = [], city = '', category = '', shop = '', minPrice = null, maxPrice = null, limit = 24, offset = 0 }) {
   const w = ["l.status = 'active'"], a = [];
   if (city) { w.push('l.city = ? COLLATE NOCASE'); a.push(city); }
   if (category) { w.push('l.category = ? COLLATE NOCASE'); a.push(category); }
   if (shop) { w.push('l.shop_id = ?'); a.push(Number(shop)); }
+  if (minPrice !== null) { w.push('l.price >= ?'); a.push(minPrice); }
+  if (maxPrice !== null) { w.push('l.price <= ?'); a.push(maxPrice); }
   const all = [q, ...terms].filter(Boolean);
   if (all.length) { w.push('(' + all.map(() => '(l.title LIKE ? OR l.description LIKE ? OR l.category LIKE ? OR s.name LIKE ?)').join(' OR ') + ')');
     all.forEach((t) => a.push(`%${t}%`, `%${t}%`, `%${t}%`, `%${t}%`)); }
@@ -76,12 +78,26 @@ export function registerRoutes(app) {
   // ---------- Site info ----------
   app.get('/api/meta', (_req, res) => res.json({
     categories: db.prepare('SELECT name,name_te,icon FROM categories WHERE active=1 ORDER BY sort,id').all(),
-    cities: db.prepare('SELECT name,name_te,state FROM cities WHERE active=1 ORDER BY sort,id').all(),
+    cities: db.prepare('SELECT name,name_te,state,lat,lng FROM cities WHERE active=1 ORDER BY sort,id').all(),
     plans: Object.keys(PLAN_LABELS).map((k) => ({ key: k, label: PLAN_LABELS[k], price: planPrice(k) })),
     premium: premium(),
     site: { name: getSetting('site_name'), email: getSetting('support_email'), phone: getSetting('support_phone'), address: getSetting('address') },
     aiEnabled: aiEnabled(),
   }));
+  // Nearest supported city to the visitor's coordinates (used to pre-select the city from their location)
+  app.get('/api/geo/nearest', (req, res) => {
+    const lat = Number(req.query.lat), lng = Number(req.query.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) return res.status(400).json({ error: 'Send lat and lng.' });
+    const rad = (x) => (x * Math.PI) / 180;
+    let best = null;
+    for (const c of db.prepare('SELECT name,lat,lng FROM cities WHERE active=1 AND lat IS NOT NULL AND lng IS NOT NULL').all()) {
+      const dLa = rad(c.lat - lat), dLo = rad(c.lng - lng);
+      const h = Math.sin(dLa / 2) ** 2 + Math.cos(rad(lat)) * Math.cos(rad(c.lat)) * Math.sin(dLo / 2) ** 2;
+      const km = 12742 * Math.asin(Math.sqrt(h));
+      if (!best || km < best.km) best = { city: c.name, km: Math.round(km) };
+    }
+    res.json(best && best.km <= 150 ? best : { city: null, nearest: best?.city || null, km: best?.km ?? null });
+  });
   app.get('/api/pages/:slug', (req, res) => {
     const p = resolvePage(req.params.slug, req.query.lang);
     p ? res.json(p) : res.status(404).json({ error: 'Page not found.' });
@@ -246,13 +262,25 @@ export function registerRoutes(app) {
 
   // ---------- Search ----------
   app.get('/api/search', limiter(120), wrap(async (req, res) => {
-    const q = clean(req.query.q, 100), city = clean(req.query.city, 60), category = clean(req.query.category, 60);
+    const original = clean(req.query.q, 100);
+    let q = original, city = clean(req.query.city, 60), category = clean(req.query.category, 60), minPrice = null, maxPrice = null, parsed = null;
+    // AI understands full sentences like "honda bike under 60k in vizag"
+    if (original.split(/\s+/).length >= 3 && aiEnabled()) {
+      try {
+        const cities = db.prepare('SELECT name FROM cities WHERE active=1').all().map((c) => c.name), cats = db.prepare('SELECT name FROM categories WHERE active=1').all().map((c) => c.name);
+        parsed = await aiParseSearch(original, cities, cats);
+        if (parsed) { q = parsed.keywords; if (parsed.city) city = parsed.city; if (parsed.category && !category) category = parsed.category; minPrice = parsed.min_price; maxPrice = parsed.max_price; }
+      } catch (e) { console.error(e.message); }
+    }
     const terms = [];
     if (q && /[\u0C00-\u0C7F]/.test(q) && aiEnabled()) { try { const en = await aiToEnglish(q); if (en) terms.push(en); } catch { /* keep going */ } }
-    const { items, total } = findListings({ q, terms, city, category, limit: 40 });
+    let { items, total } = findListings({ q, terms, city, category, minPrice, maxPrice, limit: 40 });
+    let relaxed = false;
+    if (!items.length && parsed) { ({ items, total } = findListings({ q: original, limit: 40 })); relaxed = items.length > 0; }
     let suggestions = [], aiError = false;
-    if (q && aiEnabled()) { try { suggestions = await aiSuggestions(terms[0] || q, city); } catch (e) { console.error(e.message); aiError = true; } }
-    res.json({ local: items, total, ai: suggestions, aiEnabled: aiEnabled(), aiError, translatedTo: terms[0] || '' });
+    if ((q || original) && aiEnabled()) { try { suggestions = await aiSuggestions(terms[0] || q || original, city); } catch (e) { console.error(e.message); aiError = true; } }
+    res.json({ local: items, total, ai: suggestions, aiEnabled: aiEnabled(), aiError, translatedTo: terms[0] || '', city,
+      parsed: parsed && (parsed.keywords || parsed.city || parsed.category || parsed.min_price !== null || parsed.max_price !== null) ? parsed : null, relaxed });
   }));
   app.post('/api/search/image', limiter(30), memUpload.single('image'), wrap(async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'Choose a photo (JPG, PNG or WebP).' });

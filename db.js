@@ -44,6 +44,7 @@ function addCol(table, col, def) {
 }
 addCol('users', 'role', "TEXT DEFAULT 'user'"); addCol('users', 'name', "TEXT DEFAULT ''");
 addCol('users', 'phone', "TEXT DEFAULT ''"); addCol('users', 'status', "TEXT DEFAULT 'active'");
+addCol('cities', 'lat', 'REAL'); addCol('cities', 'lng', 'REAL');
 addCol('shops', 'description', "TEXT DEFAULT ''"); addCol('shops', 'status', "TEXT DEFAULT 'active'");
 if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='products'").get() && !db.prepare('SELECT 1 FROM listings LIMIT 1').get()) {
   db.exec(`INSERT INTO listings (id,user_id,shop_id,title,description,price,category,city,phone,image,created_at)
@@ -64,6 +65,10 @@ const CITIES = [['Hyderabad', 'హైదరాబాద్', 'Telangana'], ['Vij
   ['Bengaluru', 'బెంగళూరు', 'Karnataka'], ['Chennai', 'చెన్నై', 'Tamil Nadu'], ['Mumbai', 'ముంబై', 'Maharashtra'], ['Delhi', 'ఢిల్లీ', 'Delhi'],
   ['Pune', 'పుణె', 'Maharashtra'], ['Kolkata', 'కోల్‌కతా', 'West Bengal']];
 CITIES.forEach(([n, te, st], i) => db.prepare('INSERT OR IGNORE INTO cities (name,name_te,state,sort) VALUES (?,?,?,?)').run(n, te, st, i));
+const COORDS = { Hyderabad: [17.385, 78.4867], Vijayawada: [16.5062, 80.648], Visakhapatnam: [17.6868, 83.2185], Warangal: [17.9689, 79.5941], Guntur: [16.3067, 80.4365],
+  Tirupati: [13.6288, 79.4192], Nellore: [14.4426, 79.9865], Karimnagar: [18.4392, 79.1288], Kakinada: [16.9891, 82.2475], Rajahmundry: [17.0005, 81.804], Kurnool: [15.8281, 78.0373],
+  Bengaluru: [12.9716, 77.5946], Chennai: [13.0827, 80.2707], Mumbai: [19.076, 72.8777], Delhi: [28.6139, 77.209], Pune: [18.5204, 73.8567], Kolkata: [22.5726, 88.3639] };
+for (const [n, [la, lo]] of Object.entries(COORDS)) db.prepare('UPDATE cities SET lat=?, lng=? WHERE name=? AND lat IS NULL').run(la, lo, n);
 for (const [slug, p] of Object.entries(DEFAULT_PAGES))
   db.prepare('INSERT OR IGNORE INTO pages (slug,title,title_te,body) VALUES (?,?,?,?)').run(slug, p.title, p.title_te, p.body);
 

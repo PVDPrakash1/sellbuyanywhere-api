@@ -121,7 +121,7 @@ export function registerAdmin(app) {
 
   // ---------- Simple tables: categories, cities, banners, reports, messages ----------
   const crud = (name, table, cols, { order = 'id DESC', create = true, imageCol = null } = {}) => {
-    const pick = (b, req) => cols.map(([c, t]) => (c === imageCol ? img(req, b.__old?.[c] || '') : t === 'int' ? Number(b[c]) || 0 : t === 'bool' ? bool(b[c]) : clean(b[c], 4000)));
+    const pick = (b, req) => cols.map(([c, t]) => (c === imageCol ? img(req, b.__old?.[c] || '') : t === 'int' ? Number(b[c]) || 0 : t === 'real' ? (b[c] === '' || b[c] === undefined ? null : Number(b[c])) : t === 'bool' ? bool(b[c]) : clean(b[c], 4000)));
     app.get(`/api/admin/${name}`, ...A, (_req, res) => res.json(db.prepare(`SELECT * FROM ${table} ORDER BY ${order} LIMIT 500`).all()));
     if (create) app.post(`/api/admin/${name}`, ...A, upload.single('image'), (req, res) => {
       try { res.status(201).json({ id: db.prepare(`INSERT INTO ${table} (${cols.map((c) => c[0]).join(',')}) VALUES (${cols.map(() => '?').join(',')})`).run(...pick(req.body, req)).lastInsertRowid }); }
@@ -139,7 +139,7 @@ export function registerAdmin(app) {
     app.delete(`/api/admin/${name}/:id`, ...A, (req, res) => { db.prepare(`DELETE FROM ${table} WHERE id=?`).run(req.params.id); res.json({ ok: true }); });
   };
   crud('categories', 'categories', [['name', 'text'], ['name_te', 'text'], ['icon', 'text'], ['sort', 'int'], ['active', 'bool']], { order: 'sort,id' });
-  crud('cities', 'cities', [['name', 'text'], ['name_te', 'text'], ['state', 'text'], ['sort', 'int'], ['active', 'bool']], { order: 'sort,id' });
+  crud('cities', 'cities', [['name', 'text'], ['name_te', 'text'], ['state', 'text'], ['lat', 'real'], ['lng', 'real'], ['sort', 'int'], ['active', 'bool']], { order: 'sort,id' });
   crud('banners', 'ads', [['slot', 'text'], ['title', 'text'], ['image', 'text'], ['link', 'text'], ['active', 'bool']], { imageCol: 'image' });
   crud('messages', 'messages', [['status', 'text']], { create: false });
   app.get('/api/admin/reports', ...A, (_req, res) => res.json(db.prepare(`SELECT r.*, l.title AS listing_title FROM reports r LEFT JOIN listings l ON l.id=r.listing_id ORDER BY r.id DESC LIMIT 300`).all()));

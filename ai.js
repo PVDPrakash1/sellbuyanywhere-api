@@ -74,6 +74,26 @@ export async function aiToEnglish(q) {   // Telugu voice/text search -> English 
   const t = await aiChat({ system: 'Translate the shopper search into 1 to 4 English keywords. Reply with only the keywords.', messages: [{ role: 'user', content: q }], maxTokens: 40 });
   return clean((t || '').replace(/["\n.]/g, ' '), 60);
 }
+const parseCache = new Map();
+// "honda bike under 60k in vizag" -> {keywords, city, category, min_price, max_price}. Works for English, Telugu or mixed text.
+export async function aiParseSearch(text, cities, categories) {
+  const key = text.toLowerCase();
+  if (parseCache.has(key)) return parseCache.get(key);
+  const t = await aiChat({ maxTokens: 160, temperature: 0,
+    system: 'You turn a shopper request for an Indian classifieds site into JSON. Reply with ONLY JSON: {"keywords":"1 to 4 English words naming the item, or empty","city":"","category":"","min_price":null,"max_price":null}. ' +
+      `The request may be English, Telugu or mixed. city must be exactly one of: ${cities.join(', ')} (only if the user names a city or a well-known nickname; ignore "near me"). category must be exactly one of: ${categories.join(', ')} or empty. ` +
+      'Convert "under 20k" to max_price 20000, "above 5000" to min_price 5000, "1 lakh" to 100000.',
+    messages: [{ role: 'user', content: text }] });
+  const j = parseJson(t);
+  let out = null;
+  if (j && !Array.isArray(j)) {
+    const pick = (v, list) => list.find((x) => x.toLowerCase() === String(v || '').toLowerCase()) || '';
+    const num = (v) => (Number.isFinite(Number(v)) && v !== null && v !== '' ? Math.max(0, Math.round(Number(v))) : null);
+    out = { keywords: clean(j.keywords, 60), city: pick(j.city, cities), category: pick(j.category, categories), min_price: num(j.min_price), max_price: num(j.max_price) };
+  }
+  parseCache.set(key, out);
+  return out;
+}
 export async function aiImageToQuery(buffer, mime) {
   const t = await aiChat({ system: 'You identify products in photos for a marketplace search.', maxTokens: 40,
     messages: [{ role: 'user', content: 'Name the product in this photo in 1 to 4 words, as a shopper would search for it. Reply with only the name.' }],
