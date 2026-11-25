@@ -1,0 +1,9 @@
+node_modules/
+.env
+# Live data must never be committed: it holds users, password hashes, saved API keys and uploaded photos
+data/
+uploads/
+*.db
+*.db-wal
+*.db-shm
+client/dist/
