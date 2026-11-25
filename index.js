@@ -29,7 +29,7 @@ app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: false }));
 app.use('/uploads', express.static(UPLOADS_DIR, { maxAge: '7d' }));
-app.get(['/health', '/api/health'], (_req, res) => res.json({ ok: true }));
+app.get(['/health', '/api/health'], (_req, res) => res.json({ ok: true, version: 2 }));
 
 registerRoutes(app);
 registerAdmin(app);

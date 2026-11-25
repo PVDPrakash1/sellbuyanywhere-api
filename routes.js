@@ -77,6 +77,7 @@ export function registerRoutes(app) {
 
   // ---------- Site info ----------
   app.get('/api/meta', (_req, res) => res.json({
+    version: 2,
     categories: db.prepare('SELECT name,name_te,icon FROM categories WHERE active=1 ORDER BY sort,id').all(),
     cities: db.prepare('SELECT name,name_te,state,lat,lng FROM cities WHERE active=1 ORDER BY sort,id').all(),
     plans: Object.keys(PLAN_LABELS).map((k) => ({ key: k, label: PLAN_LABELS[k], price: planPrice(k) })),
