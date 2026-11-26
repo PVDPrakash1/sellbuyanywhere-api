@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS shops (id INTEGER PRIMARY KEY, user_id INTEGER NOT NU
 CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, name_te TEXT DEFAULT '', icon TEXT DEFAULT '🎁', sort INTEGER DEFAULT 0, active INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS cities (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, name_te TEXT DEFAULT '', state TEXT DEFAULT '', sort INTEGER DEFAULT 0, active INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS listings (id INTEGER PRIMARY KEY, user_id INTEGER, shop_id INTEGER, title TEXT NOT NULL, description TEXT DEFAULT '',
-  price INTEGER NOT NULL DEFAULT 0, category TEXT DEFAULT 'Others', city TEXT NOT NULL, phone TEXT DEFAULT '', image TEXT DEFAULT '',
+  price INTEGER NOT NULL DEFAULT 0, category TEXT DEFAULT 'Others', city TEXT NOT NULL, phone TEXT DEFAULT '', image TEXT DEFAULT '', images TEXT DEFAULT '[]',
   featured_until TEXT, status TEXT DEFAULT 'active', views INTEGER DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS idx_listings_city ON listings(city);
 CREATE INDEX IF NOT EXISTS idx_listings_shop ON listings(shop_id);
@@ -44,7 +44,7 @@ function addCol(table, col, def) {
 }
 addCol('users', 'role', "TEXT DEFAULT 'user'"); addCol('users', 'name', "TEXT DEFAULT ''");
 addCol('users', 'phone', "TEXT DEFAULT ''"); addCol('users', 'status', "TEXT DEFAULT 'active'");
-addCol('cities', 'lat', 'REAL'); addCol('cities', 'lng', 'REAL');
+addCol('listings', 'images', "TEXT DEFAULT '[]'"); addCol('cities', 'lat', 'REAL'); addCol('cities', 'lng', 'REAL');
 addCol('shops', 'description', "TEXT DEFAULT ''"); addCol('shops', 'status', "TEXT DEFAULT 'active'");
 if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='products'").get() && !db.prepare('SELECT 1 FROM listings LIMIT 1').get()) {
   db.exec(`INSERT INTO listings (id,user_id,shop_id,title,description,price,category,city,phone,image,created_at)
@@ -75,10 +75,11 @@ for (const [slug, p] of Object.entries(DEFAULT_PAGES))
 // ---- Settings (secrets are encrypted in the database; environment variables are the fallback) ----
 export const DEFAULTS = {
   site_name: 'SellBuyAnywhere', support_email: 'support@sellbuyanywhere.com', support_phone: '', address: '',
+  promo_active: 'yes', promo_shop_price: '1', promo_title: 'Launch offer',
   premium_price: '50', premium_days: '7', plan_basic_price: '100', plan_ai_price: '299', plan_store_price: '599', max_ads_per_day: '10',
   ai_provider: 'llama',
   llama_api_url: 'https://api.llama.com/compat/v1', llama_api_key: '', llama_model: 'Llama-4-Maverick-17B-128E-Instruct-FP8', llama_vision_model: '',
-  gemini_api_key: '', gemini_model: 'gemini-2.5-flash',
+  gemini_api_key: '', gemini_model: 'gemini-3.5-flash',
   anthropic_api_key: '', anthropic_model: 'claude-haiku-5-5',
   razorpay_key_id: '', razorpay_key_secret: '',
   exotel_sid: '', exotel_api_key: '', exotel_api_token: '', exotel_subdomain: 'api.exotel.com', exotel_caller_id: '', exotel_flow_id: '', exotel_flow_url: '',

@@ -3,13 +3,18 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import Razorpay from 'razorpay';
 import crypto from 'crypto';
-import { db, getSetting, resolvePage } from './db.js';
+import fs from 'fs';
+import path from 'path';
+import { db, getSetting, resolvePage, UPLOADS_DIR } from './db.js';
 import { JWT_SECRET } from './config.js';
 import { aiEnabled, aiParseSearch, aiSuggestions, aiToEnglish, aiImageToQuery, aiDescribe, aiModerate, aiAsk, aiAssistant, aiShopIntake } from './ai.js';
 import { wrap, clean, normalizePhone, limiter, sendMail, randomPassword, siteUrl, isEmail, auth, optAuth, signToken, upload, memUpload } from './util.js';
 
 export const PLAN_LABELS = { basic: 'Basic shop', ai: 'Shop + AI chat and recommendations', store: 'Full e-commerce + AI' };
-const planPrice = (k) => Number(getSetting(`plan_${k}_price`)) || 0;
+const regularPrice = (k) => Number(getSetting(`plan_${k}_price`)) || 0;
+const promoOn = () => getSetting('promo_active') === 'yes' && Number(getSetting('promo_shop_price')) > 0;
+// Launch offer (e.g. open a Basic shop for Rs 1). Razorpay's minimum order is Rs 1.
+const planPrice = (k) => (k === 'basic' && promoOn() ? Math.max(1, Math.round(Number(getSetting('promo_shop_price')))) : regularPrice(k));
 const premium = () => ({ price: Number(getSetting('premium_price')) || 50, days: Number(getSetting('premium_days')) || 7 });
 
 let rz = null, rzKey = '';
@@ -27,7 +32,11 @@ async function createOrder(kind, rupees, meta, userId = null) {
   return { orderId: o.id, amount: o.amount, keyId: getSetting('razorpay_key_id') };
 }
 
-const LSEL = `SELECT l.id,l.title,l.description,l.price,l.category,l.city,l.image,l.shop_id,l.user_id,l.status,l.views,l.created_at,l.featured_until,
+const MAXIMG = 6;
+const imagesOf = (row) => { let a = []; try { a = JSON.parse(row.images || '[]'); } catch { /* ignore */ } return a.length ? a : row.image ? [row.image] : []; };
+const pubRow = ({ images, ...r }) => ({ ...r, image_count: imagesOf({ images, image: r.image }).length });
+const rmFiles = (list) => list.forEach((u) => { try { if (/^\/uploads\/[\w.-]+$/.test(u)) fs.unlinkSync(path.join(UPLOADS_DIR, path.basename(u))); } catch { /* already gone */ } });
+const LSEL = `SELECT l.images,l.id,l.title,l.description,l.price,l.category,l.city,l.image,l.shop_id,l.user_id,l.status,l.views,l.created_at,l.featured_until,
   COALESCE(l.featured_until > datetime('now'), 0) AS featured, s.name AS shop_name FROM listings l LEFT JOIN shops s ON s.id = l.shop_id`;
 
 function findListings({ q = '', terms = [], city = '', category = '', shop = '', minPrice = null, maxPrice = null, limit = 24, offset = 0 }) {
@@ -42,7 +51,7 @@ function findListings({ q = '', terms = [], city = '', category = '', shop = '',
     all.forEach((t) => a.push(`%${t}%`, `%${t}%`, `%${t}%`, `%${t}%`)); }
   const where = w.join(' AND ');
   const total = db.prepare(`SELECT COUNT(*) n FROM listings l LEFT JOIN shops s ON s.id = l.shop_id WHERE ${where}`).get(...a).n;
-  const items = db.prepare(`${LSEL} WHERE ${where} ORDER BY featured DESC, l.id DESC LIMIT ? OFFSET ?`).all(...a, limit, offset);
+  const items = db.prepare(`${LSEL} WHERE ${where} ORDER BY featured DESC, l.id DESC LIMIT ? OFFSET ?`).all(...a, limit, offset).map(pubRow);
   return { items, total };
 }
 
@@ -73,6 +82,7 @@ function fulfill(p, paymentId) {
 
 export function registerRoutes(app) {
   const ai = limiter(40);
+  const aiWrap = (fn) => wrap(async (req, res) => { try { await fn(req, res); } catch (e) { console.error('AI error:', e.message); if (!res.headersSent) res.status(502).json({ error: 'The AI service did not respond. Please try again in a moment.' }); } });
   const needAi = (res) => res.status(503).json({ error: 'AI is not set up yet.' });
 
   // ---------- Site info ----------
@@ -80,7 +90,8 @@ export function registerRoutes(app) {
     version: 2,
     categories: db.prepare('SELECT name,name_te,icon FROM categories WHERE active=1 ORDER BY sort,id').all(),
     cities: db.prepare('SELECT name,name_te,state,lat,lng FROM cities WHERE active=1 ORDER BY sort,id').all(),
-    plans: Object.keys(PLAN_LABELS).map((k) => ({ key: k, label: PLAN_LABELS[k], price: planPrice(k) })),
+    plans: Object.keys(PLAN_LABELS).map((k) => ({ key: k, label: PLAN_LABELS[k], price: planPrice(k), original: planPrice(k) < regularPrice(k) ? regularPrice(k) : null })),
+    promo: promoOn() ? { price: planPrice('basic'), original: regularPrice('basic'), title: getSetting('promo_title') } : null,
     premium: premium(),
     site: { name: getSetting('site_name'), email: getSetting('support_email'), phone: getSetting('support_phone'), address: getSetting('address') },
     aiEnabled: aiEnabled(),
@@ -164,15 +175,15 @@ export function registerRoutes(app) {
     const limit = Math.min(Number(req.query.limit) || 24, 60), page = Math.max(Number(req.query.page) || 1, 1);
     res.json(findListings({ q: clean(req.query.q, 100), city: clean(req.query.city, 60), category: clean(req.query.category, 60), shop: req.query.shop, limit, offset: (page - 1) * limit }));
   });
-  app.get('/api/listings/mine', auth, (req, res) => res.json(db.prepare(`${LSEL} WHERE l.user_id=? ORDER BY l.id DESC`).all(req.user.id)));
+  app.get('/api/listings/mine', auth, (req, res) => res.json(db.prepare(`${LSEL} WHERE l.user_id=? ORDER BY l.id DESC`).all(req.user.id).map((l) => ({ ...pubRow(l), images: imagesOf(l) }))));
   app.get('/api/listings/:id', (req, res) => {
     const l = db.prepare(`${LSEL} WHERE l.id=?`).get(req.params.id);
     if (!l || l.status === 'hidden') return res.status(404).json({ error: 'This ad is no longer available.' });
     db.prepare('UPDATE listings SET views=views+1 WHERE id=?').run(l.id);
     const shop = l.shop_id ? db.prepare('SELECT id,name,address,phone FROM shops WHERE id=?').get(l.shop_id) : null;
     const seller = db.prepare('SELECT name FROM users WHERE id=?').get(l.user_id);
-    const { user_id, ...pub } = l;
-    res.json({ ...pub, contact_phone: db.prepare('SELECT phone FROM listings WHERE id=?').get(l.id).phone || shop?.phone || '', shop, seller_name: seller?.name || '' });
+    const { user_id, images, ...pub } = l;
+    res.json({ ...pub, images: imagesOf(l), contact_phone: db.prepare('SELECT phone FROM listings WHERE id=?').get(l.id).phone || shop?.phone || '', shop, seller_name: seller?.name || '' });
   });
   const listingFields = (b, user, existing = {}) => {
     const cats = db.prepare('SELECT name FROM categories').all().map((c) => c.name);
@@ -180,7 +191,9 @@ export function registerRoutes(app) {
       category: cats.includes(b.category) ? b.category : existing.category || 'Others', city: clean(b.city, 60) || existing.city || '',
       phone: normalizePhone(b.phone) || user.phone || existing.phone || '' };
   };
-  app.post('/api/listings', auth, upload.single('image'), wrap(async (req, res) => {
+  const photos = upload.fields([{ name: 'images', maxCount: MAXIMG }, { name: 'image', maxCount: 1 }]);
+  const filesOf = (req) => [...(req.files?.images || []), ...(req.files?.image || [])].map((f) => `/uploads/${f.filename}`);
+  app.post('/api/listings', auth, photos, wrap(async (req, res) => {
     const f = listingFields(req.body, req.user);
     if (!f.title || !f.city) return res.status(400).json({ error: 'Add a title and choose a city.' });
     if (!f.phone) return res.status(400).json({ error: 'Add a valid 10-digit mobile number so buyers can reach you.' });
@@ -190,22 +203,30 @@ export function registerRoutes(app) {
     const mod = await aiModerate(f);
     const shop = db.prepare("SELECT id FROM shops WHERE user_id=? AND status='active' ORDER BY id LIMIT 1").get(req.user.id);
     const useShop = shop && req.body.as_shop === 'true';
-    const id = db.prepare('INSERT INTO listings (user_id,shop_id,title,description,price,category,city,phone,image,status) VALUES (?,?,?,?,?,?,?,?,?,?)')
-      .run(req.user.id, useShop ? shop.id : null, f.title, f.description, f.price, f.category, f.city, f.phone, req.file ? `/uploads/${req.file.filename}` : '', mod.ok ? 'active' : 'pending').lastInsertRowid;
+    const pics = filesOf(req).slice(0, MAXIMG);
+    const id = db.prepare('INSERT INTO listings (user_id,shop_id,title,description,price,category,city,phone,image,images,status) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+      .run(req.user.id, useShop ? shop.id : null, f.title, f.description, f.price, f.category, f.city, f.phone, pics[0] || '', JSON.stringify(pics), mod.ok ? 'active' : 'pending').lastInsertRowid;
     res.status(201).json({ id, status: mod.ok ? 'active' : 'pending', reason: mod.reason });
   }));
   const owned = (req) => db.prepare('SELECT * FROM listings WHERE id=? AND user_id=?').get(req.params.id, req.user.id);
-  app.put('/api/listings/:id', auth, upload.single('image'), (req, res) => {
+  app.put('/api/listings/:id', auth, photos, (req, res) => {
     const l = owned(req);
     if (!l) return res.status(404).json({ error: 'Ad not found.' });
     const f = listingFields(req.body, req.user, l);
     if (!f.title) return res.status(400).json({ error: 'Add a title.' });
-    db.prepare('UPDATE listings SET title=?,description=?,price=?,category=?,city=?,phone=?,image=? WHERE id=?')
-      .run(f.title, f.description, f.price, f.category, f.city, f.phone, req.file ? `/uploads/${req.file.filename}` : l.image, l.id);
+    const had = imagesOf(l);
+    let keep = had;
+    if (req.body.keep !== undefined) { try { keep = JSON.parse(req.body.keep).filter((u) => had.includes(u)); } catch { keep = had; } }
+    const pics = [...keep, ...filesOf(req)].slice(0, MAXIMG);
+    rmFiles(had.filter((u) => !pics.includes(u)));
+    db.prepare('UPDATE listings SET title=?,description=?,price=?,category=?,city=?,phone=?,image=?,images=? WHERE id=?')
+      .run(f.title, f.description, f.price, f.category, f.city, f.phone, pics[0] || '', JSON.stringify(pics), l.id);
     res.json({ ok: true });
   });
   app.delete('/api/listings/:id', auth, (req, res) => {
-    if (!owned(req)) return res.status(404).json({ error: 'Ad not found.' });
+    const own = owned(req);
+    if (!own) return res.status(404).json({ error: 'Ad not found.' });
+    rmFiles(imagesOf(own));
     db.prepare('DELETE FROM listings WHERE id=?').run(req.params.id);
     res.json({ ok: true });
   });
@@ -283,7 +304,7 @@ export function registerRoutes(app) {
     res.json({ local: items, total, ai: suggestions, aiEnabled: aiEnabled(), aiError, translatedTo: terms[0] || '', city,
       parsed: parsed && (parsed.keywords || parsed.city || parsed.category || parsed.min_price !== null || parsed.max_price !== null) ? parsed : null, relaxed });
   }));
-  app.post('/api/search/image', limiter(30), memUpload.single('image'), wrap(async (req, res) => {
+  app.post('/api/search/image', limiter(30), memUpload.single('image'), aiWrap(async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'Choose a photo (JPG, PNG or WebP).' });
     if (!aiEnabled()) return needAi(res);
     const query = await aiImageToQuery(req.file.buffer, req.file.mimetype);
@@ -291,26 +312,26 @@ export function registerRoutes(app) {
   }));
 
   // ---------- AI helpers ----------
-  app.post('/api/ai/chat', ai, wrap(async (req, res) => {
+  app.post('/api/ai/chat', ai, aiWrap(async (req, res) => {
     if (!aiEnabled()) return needAi(res);
     const history = (req.body.messages || []).slice(-10).map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: clean(m.content, 800) })).filter((m) => m.content);
     if (!history.length) return res.status(400).json({ error: 'Say something first.' });
     const settings = { site: getSetting('site_name'), premium_price: premium().price, premium_days: premium().days, plan_basic_price: planPrice('basic') };
     res.json(await aiAssistant(history, req.body.lang, settings));
   }));
-  app.post('/api/ai/describe', ai, auth, wrap(async (req, res) => {
+  app.post('/api/ai/describe', ai, auth, aiWrap(async (req, res) => {
     if (!aiEnabled()) return needAi(res);
     if (!clean(req.body.title)) return res.status(400).json({ error: 'Type the title first.' });
     res.json({ description: await aiDescribe({ title: clean(req.body.title, 120), category: clean(req.body.category, 60), city: clean(req.body.city, 60), l: req.body.lang }) });
   }));
-  app.post('/api/ai/ask', ai, wrap(async (req, res) => {
+  app.post('/api/ai/ask', ai, aiWrap(async (req, res) => {
     if (!aiEnabled()) return needAi(res);
     const l = db.prepare(`${LSEL} WHERE l.id=? AND l.status='active'`).get(req.body.listingId);
     if (!l || !clean(req.body.question)) return res.status(400).json({ error: 'Ask a question about an available ad.' });
     const history = (req.body.history || []).slice(-6).map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: clean(m.content, 500) }));
     res.json({ reply: await aiAsk(l, clean(req.body.question, 400), history, req.body.lang) });
   }));
-  app.post('/api/ai/shop-intake', ai, wrap(async (req, res) => {
+  app.post('/api/ai/shop-intake', ai, aiWrap(async (req, res) => {
     if (!aiEnabled()) return needAi(res);
     const cities = db.prepare('SELECT name FROM cities WHERE active=1').all().map((c) => c.name);
     const history = (req.body.history || []).slice(-20).map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: clean(m.content, 500) }));

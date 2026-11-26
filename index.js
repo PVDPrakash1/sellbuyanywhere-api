@@ -49,7 +49,7 @@ if (dist) {
 }
 app.use((err, _req, res, _next) => {
   if (err.status !== 503) console.error(err);
-  res.status(err.status || 500).json({ error: err.status === 503 ? err.message : err.code === 'LIMIT_FILE_SIZE' ? 'That file is too large.' : 'Something went wrong on our side. Try again.' });
+  res.status(err.status || (String(err.code || '').startsWith('LIMIT_') ? 400 : 500)).json({ error: err.status === 503 ? err.message : err.code === 'LIMIT_FILE_SIZE' ? 'That photo is too large (5 MB maximum).' : err.code === 'LIMIT_UNEXPECTED_FILE' ? 'You can upload up to 6 photos.' : 'Something went wrong on our side. Try again.' });
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => console.log(`SellBuyAnywhere running on http://localhost:${PORT}`));

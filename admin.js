@@ -1,7 +1,7 @@
 // Admin API: full create/read/update/delete for every part of the site. All routes need an admin login.
 import bcrypt from 'bcryptjs';
 import { db, getSetting, setSetting, SECRET_KEYS, DEFAULTS, wsKey } from './db.js';
-import { aiChat, aiEnabled, aiProvider } from './ai.js';
+import { aiChat, aiEnabled, aiListModels, aiProvider, aiStatus } from './ai.js';
 import { PLAN_LABELS } from './routes.js';
 import { clean, normalizePhone, adminOnly, upload, wrap, randomPassword, isEmail, siteUrl } from './util.js';
 
@@ -24,7 +24,7 @@ export function registerAdmin(app) {
     revenue: n("SELECT COALESCE(SUM(amount),0) n FROM payments WHERE status='paid'"),
     revenueShops: n("SELECT COALESCE(SUM(amount),0) n FROM payments WHERE status='paid' AND kind='shop'"),
     revenuePremium: n("SELECT COALESCE(SUM(amount),0) n FROM payments WHERE status='paid' AND kind='featured'"),
-    ai: { provider: aiProvider(), enabled: aiEnabled() },
+    ai: { provider: aiProvider(), enabled: aiEnabled(), ...aiStatus() },
   }));
 
   // ---------- Users ----------
@@ -101,6 +101,7 @@ export function registerAdmin(app) {
     const owner = db.prepare('SELECT id FROM users WHERE email=?').get(clean(b.owner_email, 120).toLowerCase()) || { id: req.user.id };
     const id = db.prepare('INSERT INTO listings (user_id,shop_id,title,description,price,category,city,phone,image,status) VALUES (?,?,?,?,?,?,?,?,?,?)')
       .run(owner.id, Number(b.shop_id) || null, v.title, v.description, v.price, v.category, v.city, v.phone, v.image, v.status).lastInsertRowid;
+    if (v.image) setPics(id, v.image, []);
     if (Number(b.featured_days) > 0) db.prepare("UPDATE listings SET featured_until=datetime('now','+'||?||' days') WHERE id=?").run(Number(b.featured_days), id);
     res.status(201).json({ id });
   });
@@ -110,6 +111,7 @@ export function registerAdmin(app) {
     const v = lvals(b, req, l);
     db.prepare('UPDATE listings SET title=?,description=?,price=?,category=?,city=?,phone=?,image=?,status=?,shop_id=? WHERE id=?')
       .run(v.title, v.description, v.price, v.category, v.city, v.phone, v.image, v.status, b.shop_id === undefined ? l.shop_id : Number(b.shop_id) || null, l.id);
+    if (req.file) { let list = []; try { list = JSON.parse(l.images || '[]'); } catch { /* ignore */ } setPics(l.id, v.image, list.length ? list : l.image ? [l.image] : []); }
     if (b.featured_days !== undefined && b.featured_days !== '') {
       const d = Number(b.featured_days);
       d > 0 ? db.prepare("UPDATE listings SET featured_until=datetime('now','+'||?||' days') WHERE id=?").run(d, l.id)
@@ -177,7 +179,7 @@ export function registerAdmin(app) {
   // ---------- Settings (AI provider, payments, Exotel, prices, site info) ----------
   const GROUPS = [
     { title: 'Site', fields: [['site_name', 'Site name'], ['support_email', 'Support email'], ['support_phone', 'Support phone'], ['address', 'Business address', 'textarea']] },
-    { title: 'Pricing', fields: [['premium_price', 'Premium ad price (Rs)', 'number'], ['premium_days', 'Premium ad days', 'number'], ['plan_basic_price', 'Basic shop plan (Rs)', 'number'],
+    { title: 'Pricing', fields: [['promo_active', 'Launch offer on Basic shop', 'select', [['yes', 'On'], ['no', 'Off']]], ['promo_shop_price', 'Launch offer price (Rs, minimum 1)', 'number'], ['promo_title', 'Offer label'], ['premium_price', 'Premium ad price (Rs)', 'number'], ['premium_days', 'Premium ad days', 'number'], ['plan_basic_price', 'Basic shop plan (Rs)', 'number'],
       ['plan_ai_price', 'AI shop plan (Rs)', 'number'], ['plan_store_price', 'Full store plan (Rs)', 'number'], ['max_ads_per_day', 'Max ads per user per day', 'number']] },
     { title: 'AI provider (whole site)', fields: [['ai_provider', 'Active AI', 'select', [['llama', 'Meta Llama'], ['gemini', 'Google Gemini'], ['anthropic', 'Claude (Anthropic)']]],
       ['llama_api_url', 'Llama API URL (OpenAI-compatible)'], ['llama_api_key', 'Llama API key', 'secret'], ['llama_model', 'Llama model'], ['llama_vision_model', 'Llama vision model (optional)'],
@@ -202,9 +204,12 @@ export function registerAdmin(app) {
     }
     res.json({ ok: true });
   });
+  app.get('/api/admin/ai-models', ...A, wrap(async (_req, res) => {
+    try { res.json({ provider: aiProvider(), models: await aiListModels() }); } catch (e) { res.status(502).json({ error: e.message }); }
+  }));
   app.post('/api/admin/ai-test', ...A, wrap(async (_req, res) => {
     if (!aiEnabled()) return res.status(400).json({ error: `No API key saved for ${aiProvider()}.` });
-    try { const t = await aiChat({ messages: [{ role: 'user', content: 'Reply with the single word: OK' }], maxTokens: 20 }); res.json({ ok: true, provider: aiProvider(), reply: clean(t, 80) }); }
+    try { const t = await aiChat({ messages: [{ role: 'user', content: 'Reply with the single word: OK' }], maxTokens: 20 }); res.json({ ok: true, provider: aiProvider(), model: aiStatus().model, reply: clean(t, 80) }); }
     catch (e) { res.status(502).json({ error: e.message }); }
   }));
 }

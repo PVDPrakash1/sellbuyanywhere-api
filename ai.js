@@ -11,12 +11,30 @@ async function post(url, headers, body) {
   try { r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body), signal: AbortSignal.timeout(30000) }); }
   catch (e) { throw new Error(`Could not reach the AI service (${e.cause?.code || e.message}).`); }
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(`AI ${r.status}: ${String(j.error?.message || j.message || j.error || '').slice(0, 160)}`);
+  if (!r.ok) { const e = new Error(`AI ${r.status}: ${String(j.error?.message || j.message || j.error || '').slice(0, 200)}`); e.status = r.status; throw e; }
   return j;
 }
 
+// What the last AI call did, so the admin can see why "AI is not working" (shown on the admin dashboard)
+const status = { ok: null, error: '', at: null, model: '' };
+export const aiStatus = () => ({ ...status });
+
+// Gemini model names change: gemini-2.5-flash was shut down on 16 Oct 2026 (replacement: gemini-3.5-flash). If the saved model returns 404, try current ones.
+const GEMINI_FALLBACKS = ['gemini-3.5-flash', 'gemini-3.1-flash-lite', 'gemini-3-flash-preview'];
+const geminiSubst = new Map();
+async function geminiCall(model, key, system, contents, maxTokens, temperature) {
+  const body = { contents, generationConfig: { temperature, maxOutputTokens: maxTokens + 3000 } };   // thinking tokens count toward the limit
+  if (system) body.systemInstruction = { parts: [{ text: system }] };                                  // an empty system prompt makes Gemini reject the request
+  const j = await post(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, { 'x-goog-api-key': key }, body);
+  const cand = j.candidates?.[0];
+  const text = (cand?.content?.parts || []).map((x) => x.text || '').join('');
+  if (!text) throw new Error(`Gemini ${model} returned no text (${j.promptFeedback?.blockReason || cand?.finishReason || 'empty response'}).`);
+  status.model = model;
+  return text;
+}
+
 // messages: [{role:'user'|'assistant', content}], image: {mime, base64} attaches to the last user message
-export async function aiChat({ system = '', messages, image = null, maxTokens = 700, temperature = 0.3 }) {
+async function aiChatRaw({ system = '', messages, image = null, maxTokens = 700, temperature = 0.3 }) {
   if (!aiEnabled()) return null;
   const p = aiProvider();
   const key = getSetting(KEY_OF[p]);
@@ -33,9 +51,14 @@ export async function aiChat({ system = '', messages, image = null, maxTokens = 
   if (p === 'gemini') {
     const contents = msgs.map((m, i) => ({ role: m.role === 'assistant' ? 'model' : 'user',
       parts: [{ text: m.content }, ...(image && i === lastUser ? [{ inlineData: { mimeType: image.mime, data: image.base64 } }] : [])] }));
-    const j = await post(`https://generativelanguage.googleapis.com/v1beta/models/${getSetting('gemini_model')}:generateContent`, { 'x-goog-api-key': key },
-      { systemInstruction: { parts: [{ text: system }] }, contents, generationConfig: { temperature, maxOutputTokens: maxTokens + 1000 } });
-    return (j.candidates?.[0]?.content?.parts || []).map((x) => x.text || '').join('');
+    const configured = getSetting('gemini_model');
+    const chain = [...new Set([geminiSubst.get(configured) || configured, ...GEMINI_FALLBACKS].filter(Boolean))];
+    let last;
+    for (const m of chain) {
+      try { const t = await geminiCall(m, key, system, contents, maxTokens, temperature); if (m !== configured) geminiSubst.set(configured, m); return t; }
+      catch (e) { last = e; if (e.status !== 404) throw e; }
+    }
+    throw new Error(`No Gemini model is available for this key (tried ${chain.join(', ')}). ${last.message} Open Admin > Settings > "Show available models" and pick one.`);
   }
   const out = [{ role: 'system', content: system }, ...msgs.map((m, i) => (image && i === lastUser
     ? { role: 'user', content: [{ type: 'text', text: m.content }, { type: 'image_url', image_url: { url: `data:${image.mime};base64,${image.base64}` } }] } : m))];
@@ -43,7 +66,35 @@ export async function aiChat({ system = '', messages, image = null, maxTokens = 
   const j = await post(`${getSetting('llama_api_url').replace(/\/$/, '')}/chat/completions`, { Authorization: `Bearer ${key}` },
     { model, messages: out, temperature, max_tokens: maxTokens });
   const c = j.choices?.[0]?.message?.content;
+  status.model = model;
   return typeof c === 'string' ? c : Array.isArray(c) ? c.map((x) => x.text || '').join('') : '';
+}
+
+export async function aiChat(opts) {
+  if (!aiEnabled()) return null;
+  try {
+    const t = await aiChatRaw(opts);
+    if (!String(t).trim()) throw new Error('The AI returned an empty answer.');
+    Object.assign(status, { ok: true, error: '', at: Date.now() });
+    return t;
+  } catch (e) { Object.assign(status, { ok: false, error: e.message, at: Date.now() }); throw e; }
+}
+
+// Models the saved key can use (for the admin "Show available models" button)
+export async function aiListModels() {
+  const p = aiProvider(), key = getSetting(KEY_OF[p]);
+  if (!key) throw new Error(`No API key saved for ${p}.`);
+  const get = async (url, headers) => {
+    const r = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(`${r.status}: ${j.error?.message || j.message || 'could not list models'}`);
+    return j;
+  };
+  if (p === 'gemini') { const j = await get('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', { 'x-goog-api-key': key });
+    return (j.models || []).filter((m) => (m.supportedGenerationMethods || []).includes('generateContent') && /gemini/.test(m.name)).map((m) => m.name.replace('models/', '')); }
+  if (p === 'anthropic') { const j = await get('https://api.anthropic.com/v1/models?limit=100', { 'x-api-key': key, 'anthropic-version': '2023-06-01' }); return (j.data || []).map((m) => m.id); }
+  const j = await get(`${getSetting('llama_api_url').replace(/\/$/, '')}/models`, { Authorization: `Bearer ${key}` });
+  return (j.data || j.models || []).map((m) => m.id || m.name);
 }
 
 export function parseJson(text) {
