@@ -10,6 +10,7 @@ import { db, UPLOADS_DIR } from './db.js';
 import { registerRoutes } from './routes.js';
 import { registerAdmin } from './admin.js';
 import { registerVoice, attachVoiceSocket } from './voice.js';
+import { startBackups } from './backup.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 4000;
@@ -54,3 +55,4 @@ app.use((err, _req, res, _next) => {
 
 const server = app.listen(PORT, '0.0.0.0', () => console.log(`SellBuyAnywhere running on http://localhost:${PORT}`));
 attachVoiceSocket(server);
+startBackups();

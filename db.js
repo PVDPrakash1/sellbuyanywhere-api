@@ -1,16 +1,43 @@
 import Database from 'better-sqlite3';
 import crypto from 'crypto';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { JWT_SECRET } from './config.js';
 import { DEFAULT_PAGES } from './pages-default.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-export const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');           // set DATA_DIR to a persistent disk in production
-export const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(__dirname, 'uploads');
+export const APP_DIR = __dirname;
+
+// ---- Where live data is kept ----
+// A publish/deploy replaces the code folder with a fresh copy of the project, including any data/ folder inside it. That is what was
+// wiping live data. So live data now lives OUTSIDE the code folder (next to it, or in the home folder). DATA_DIR / UPLOADS_DIR override this.
+function pickBase() {
+  for (const base of [path.resolve(__dirname, '..'), os.homedir()]) {
+    try { const d = path.join(base, 'sba-data'); fs.mkdirSync(d, { recursive: true }); fs.accessSync(d, fs.constants.W_OK); return d; } catch { /* try the next place */ }
+  }
+  return path.join(__dirname, 'storage');                        // last resort: inside the code folder (not safe from deploys)
+}
+const BASE = pickBase();
+export const DATA_DIR = process.env.DATA_DIR || path.join(BASE, 'data');
+export const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(BASE, 'uploads');
+export const BACKUP_DIR = process.env.BACKUP_DIR || path.join(BASE, 'backups');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+
+// One-time move of data from the old location (./data, ./uploads inside the code folder) to the safe location.
+const LEGACY_DB = path.join(__dirname, 'data', 'sba.db');
+if (!fs.existsSync(path.join(DATA_DIR, 'sba.db')) && fs.existsSync(LEGACY_DB) && path.resolve(DATA_DIR) !== path.resolve(__dirname, 'data')) {
+  try {
+    const old = new Database(LEGACY_DB, { readonly: false });
+    old.exec(`VACUUM INTO '${path.join(DATA_DIR, 'sba.db').replace(/'/g, "''")}'`);
+    old.close();
+    const lu = path.join(__dirname, 'uploads');
+    if (fs.existsSync(lu)) fs.cpSync(lu, UPLOADS_DIR, { recursive: true });
+    console.log(`Moved existing data to ${DATA_DIR}`);
+  } catch (e) { console.error('Could not move old data:', e.message); }
+}
 export const db = new Database(path.join(DATA_DIR, 'sba.db'));
 db.pragma('journal_mode = WAL');
 
@@ -111,3 +138,8 @@ export function resolvePage(slug, lang = 'en') {
   const te = lang === 'te';
   return { slug, title: fill((te && p.title_te) || p.title), body: fill((te && p.body_te) || p.body), translated: te && !!p.body_te };
 }
+
+// ---- Storage bookkeeping: lets the admin see if data is being reset (creation date / restart count go back each publish) ----
+if (!db.prepare("SELECT 1 FROM settings WHERE key='db_created_at'").get()) setSetting('db_created_at', new Date().toISOString());
+setSetting('boots', String((Number(getSetting('boots')) || 0) + 1));
+setSetting('last_boot_at', new Date().toISOString());

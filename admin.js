@@ -1,6 +1,10 @@
 // Admin API: full create/read/update/delete for every part of the site. All routes need an admin login.
 import bcrypt from 'bcryptjs';
-import { db, getSetting, setSetting, SECRET_KEYS, DEFAULTS, wsKey } from './db.js';
+import path from 'path';
+import multer from 'multer';
+import fs from 'fs';
+import { db, getSetting, setSetting, SECRET_KEYS, DEFAULTS, wsKey, APP_DIR, DATA_DIR, UPLOADS_DIR, BACKUP_DIR } from './db.js';
+import { backupNow, listBackups, restoreFrom, zipBackup } from './backup.js';
 import { aiChat, aiEnabled, aiListModels, aiProvider, aiStatus } from './ai.js';
 import { PLAN_LABELS } from './routes.js';
 import { clean, normalizePhone, adminOnly, upload, wrap, randomPassword, isEmail, siteUrl } from './util.js';
@@ -25,6 +29,32 @@ export function registerAdmin(app) {
     revenueShops: n("SELECT COALESCE(SUM(amount),0) n FROM payments WHERE status='paid' AND kind='shop'"),
     revenuePremium: n("SELECT COALESCE(SUM(amount),0) n FROM payments WHERE status='paid' AND kind='featured'"),
     ai: { provider: aiProvider(), enabled: aiEnabled(), ...aiStatus() },
+    storage: { dataDir: DATA_DIR, insideApp: path.resolve(DATA_DIR).startsWith(path.resolve(APP_DIR)), createdAt: getSetting('db_created_at'), boots: Number(getSetting('boots')) || 0, lastBackup: listBackups()[0]?.at || null },
+  }));
+
+  // ---------- Backup and restore ----------
+  const restoreUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 250 * 1024 * 1024 } });
+  const dirSize = (d) => { try { return fs.readdirSync(d).reduce((s, f) => s + fs.statSync(path.join(d, f)).size, 0); } catch { return 0; } };
+  app.get('/api/admin/backup', ...A, (_req, res) => res.json({
+    dataDir: DATA_DIR, uploadsDir: UPLOADS_DIR, backupDir: BACKUP_DIR, insideApp: path.resolve(DATA_DIR).startsWith(path.resolve(APP_DIR)),
+    dbBytes: dirSize(DATA_DIR), photoBytes: dirSize(UPLOADS_DIR), createdAt: getSetting('db_created_at'), boots: Number(getSetting('boots')) || 0, lastBoot: getSetting('last_boot_at'), backups: listBackups(),
+  }));
+  app.post('/api/admin/backup/now', ...A, wrap(async (_req, res) => res.json({ ok: true, name: backupNow('manual') })));
+  app.get('/api/admin/backup/download', ...A, wrap(async (_req, res) => {
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="sba-backup-${new Date().toISOString().slice(0, 10)}.zip"`);
+    res.send(zipBackup());
+  }));
+  app.get('/api/admin/backup/file/:name', ...A, (req, res) => {
+    if (!/^sba-[\w.-]+\.db$/.test(req.params.name) || !fs.existsSync(path.join(BACKUP_DIR, req.params.name))) return res.status(404).json({ error: 'Backup not found.' });
+    res.download(path.join(BACKUP_DIR, req.params.name));
+  });
+  app.post('/api/admin/backup/restore', ...A, restoreUpload.single('file'), wrap(async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'Choose a backup file (.zip or .db).' });
+    try {
+      const me = db.prepare('SELECT email,password_hash,name FROM users WHERE id=?').get(req.user.id);
+      res.json({ ok: true, ...restoreFrom(req.file.buffer, me) });
+    } catch (e) { res.status(400).json({ error: e.message }); }
   }));
 
   // ---------- Users ----------
