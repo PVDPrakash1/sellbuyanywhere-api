@@ -5,7 +5,7 @@ import { WebSocketServer } from 'ws';
 import crypto from 'crypto';
 import { db, getSetting, wsKey } from './db.js';
 import { aiChat, aiEnabled } from './ai.js';
-import { clean, normalizePhone, limiter, wrap, siteUrl } from './util.js';
+import { clean, normalizePhone, limiter, wrap, siteUrl, safeApp } from './util.js';
 
 const STT_URL = process.env.GOOGLE_STT_URL || 'https://speech.googleapis.com/v1/speech:recognize';
 const TTS_URL = process.env.GOOGLE_TTS_URL || 'https://texttospeech.googleapis.com/v1/text:synthesize';
@@ -14,22 +14,23 @@ const spoken = (d) => String(d).replace(/\D/g, '').split('').join(' ');
 const ready = () => ['exotel_sid', 'exotel_api_key', 'exotel_api_token', 'exotel_caller_id'].every((k) => getSetting(k)) && (getSetting('exotel_flow_id') || getSetting('exotel_flow_url')) && siteUrl().startsWith('https://');
 const keyOk = (k) => { const a = Buffer.from(String(k || '')), b = Buffer.from(wsKey()); return a.length === b.length && crypto.timingSafeEqual(a, b); };
 
-const infoFor = (callId) => db.prepare(`SELECT l.title,l.price,l.category,l.description,l.city,COALESCE(NULLIF(l.phone,''),s.phone) AS phone,s.name AS shop,s.address
-  FROM calls c JOIN listings l ON l.id=c.product_id LEFT JOIN shops s ON s.id=l.shop_id WHERE c.id=?`).get(callId);
+const infoFor = async (callId) => (await db.prepare(`SELECT l.title,l.price,l.category,l.description,l.city,COALESCE(NULLIF(l.phone,''),s.phone) AS phone,s.name AS shop,s.address
+  FROM calls c JOIN listings l ON l.id=c.product_id LEFT JOIN shops s ON s.id=l.shop_id WHERE c.id=?`).get(callId));
 
-export function registerVoice(app) {
+export function registerVoice(appRaw) {
+  const app = safeApp(appRaw);
   app.post('/api/calls', limiter(10), wrap(async (req, res) => {
     if (!ready()) return res.status(503).json({ error: 'AI calling is not set up yet.' });
     const phone = normalizePhone(req.body.phone);
     if (!phone) return res.status(400).json({ error: 'Enter a 10-digit Indian mobile number.' });
     if (!req.body.consent) return res.status(400).json({ error: 'Tick the box to agree to receive the call.' });
-    const l = db.prepare("SELECT id,shop_id FROM listings WHERE id=? AND status='active'").get(Number(req.body.listingId || req.body.productId));
+    const l = (await db.prepare("SELECT id,shop_id FROM listings WHERE id=? AND status='active'").get(Number(req.body.listingId || req.body.productId)));
     if (!l) return res.status(404).json({ error: 'This ad is no longer available.' });
-    const day = "created_at >= datetime('now','-1 day')";
-    if (db.prepare(`SELECT COUNT(*) n FROM calls WHERE phone=? AND ${day}`).get(phone).n >= 3) return res.status(429).json({ error: 'You have reached today’s limit of 3 calls. Try again tomorrow.' });
-    if (db.prepare(`SELECT COUNT(*) n FROM calls WHERE ${day}`).get().n >= Number(getSetting('calls_per_day_max') || 200)) return res.status(429).json({ error: 'Calls are busy right now. Try again later.' });
+    const day = "created_at >= (NOW() - INTERVAL 1 DAY)";
+    if ((await db.prepare(`SELECT COUNT(*) n FROM calls WHERE phone=? AND ${day}`).get(phone)).n >= 3) return res.status(429).json({ error: 'You have reached today’s limit of 3 calls. Try again tomorrow.' });
+    if ((await db.prepare(`SELECT COUNT(*) n FROM calls WHERE ${day}`).get()).n >= Number(getSetting('calls_per_day_max') || 200)) return res.status(429).json({ error: 'Calls are busy right now. Try again later.' });
 
-    const id = db.prepare("INSERT INTO calls (product_id,shop_id,phone,status) VALUES (?,?,?, 'queued')").run(l.id, l.shop_id, phone).lastInsertRowid;
+    const id = (await db.prepare("INSERT INTO calls (product_id,shop_id,phone,status) VALUES (?,?,?, 'queued')").run(l.id, l.shop_id, phone)).lastInsertRowid;
     try {
       const sid = getSetting('exotel_sid');
       const flow = getSetting('exotel_flow_url') || `http://my.exotel.com/${sid}/exoml/start_voice/${getSetting('exotel_flow_id')}`;
@@ -41,20 +42,20 @@ export function registerVoice(app) {
         headers: { Authorization: 'Basic ' + Buffer.from(`${getSetting('exotel_api_key')}:${getSetting('exotel_api_token')}`).toString('base64'), 'Content-Type': 'application/x-www-form-urlencoded' } });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(j.RestException?.Message || j.message || `Exotel error ${r.status}`);
-      db.prepare("UPDATE calls SET status='calling', call_sid=? WHERE id=?").run(j.Call?.Sid || j.call?.sid || null, id);
+      (await db.prepare("UPDATE calls SET status='calling', call_sid=? WHERE id=?").run(j.Call?.Sid || j.call?.sid || null, id));
       res.json({ ok: true, phone });
     } catch (e) {
       console.error('Call failed:', e.message);
-      db.prepare("UPDATE calls SET status='failed', note=? WHERE id=?").run(String(e.message).slice(0, 200), id);
+      (await db.prepare("UPDATE calls SET status='failed', note=? WHERE id=?").run(String(e.message).slice(0, 200), id));
       res.status(502).json({ error: 'We could not place the call. Check the number and try again.' });
     }
   }));
 
-  app.post('/api/voice/status', (req, res) => {
+  app.post('/api/voice/status', async (req, res) => {
     if (!keyOk(req.query.key)) return res.status(403).end();
     const raw = String(req.body.Status || req.body.CallStatus || '').toLowerCase();
     const s = { completed: 'completed', busy: 'busy', 'no-answer': 'no-answer', failed: 'failed', canceled: 'canceled', 'in-progress': 'answered' }[raw];
-    if (s) db.prepare('UPDATE calls SET status=? WHERE id=?').run(s, Number(req.query.callId));
+    if (s) (await db.prepare('UPDATE calls SET status=? WHERE id=?').run(s, Number(req.query.callId)));
     res.end();
   });
 }
@@ -150,10 +151,10 @@ export function attachVoiceSocket(server) {
         st.sid = m.stream_sid || m.start?.stream_sid;
         const sid = m.start?.call_sid || m.call_sid;
         const cp = String(m.start?.custom_parameters || m.start?.customParameters || '');
-        let row = sid && db.prepare('SELECT id FROM calls WHERE call_sid=?').get(sid);
-        if (!row && /(\d+)/.test(cp)) row = db.prepare('SELECT id FROM calls WHERE id=?').get(Number(cp.match(/(\d+)/)[1]));
-        if (!row) { const c = db.prepare("SELECT id FROM calls WHERE status='calling' AND created_at >= datetime('now','-3 minutes')").all(); if (c.length === 1) row = c[0]; }
-        st.info = row && infoFor(row.id);
+        let row = sid && (await db.prepare('SELECT id FROM calls WHERE call_sid=?').get(sid));
+        if (!row && /(\d+)/.test(cp)) row = (await db.prepare('SELECT id FROM calls WHERE id=?').get(Number(cp.match(/(\d+)/)[1])));
+        if (!row) { const c = (await db.prepare("SELECT id FROM calls WHERE status='calling' AND created_at >= (NOW() - INTERVAL 3 MINUTE)").all()); if (c.length === 1) row = c[0]; }
+        st.info = row && (await infoFor(row.id));
         if (!st.info) return ws.close();
         const i = st.info;
         st.system = 'You are the AI voice assistant of SellBuyAnywhere, an Indian marketplace, on a phone call with a buyer. Always reply in Telugu using Telugu script; product and shop names may stay in English. ' +

@@ -6,21 +6,25 @@ import bcrypt from 'bcryptjs';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { db, UPLOADS_DIR } from './db.js';
+import { db, initDb, pool, UPLOADS_DIR } from './db.js';
 import { registerRoutes } from './routes.js';
 import { registerAdmin } from './admin.js';
 import { registerVoice, attachVoiceSocket } from './voice.js';
 import { startBackups } from './backup.js';
+import { safeApp } from './util.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 4000;
 
+try { await initDb(); }
+catch (e) { console.error('\nDATABASE ERROR:', e.message, '\n'); process.exit(1); }
+
 // Admin login from the environment (created or updated every start)
 if (process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD) {
   const h = bcrypt.hashSync(process.env.ADMIN_PASSWORD, 10), e = process.env.ADMIN_EMAIL.toLowerCase();
-  const ex = db.prepare('SELECT id FROM users WHERE email=?').get(e);
-  if (ex) db.prepare("UPDATE users SET role='admin', status='active', password_hash=? WHERE id=?").run(h, ex.id);
-  else db.prepare("INSERT INTO users (email,password_hash,role,name) VALUES (?,?,'admin','Admin')").run(e, h);
+  const ex = await db.prepare('SELECT id FROM users WHERE email=?').get(e);
+  if (ex) await db.prepare("UPDATE users SET role='admin', status='active', password_hash=? WHERE id=?").run(h, ex.id);
+  else await db.prepare("INSERT INTO users (email,password_hash,role,name) VALUES (?,?,'admin','Admin')").run(e, h);
 }
 
 const app = express();
@@ -29,8 +33,20 @@ app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: { poli
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: false }));
-app.use('/uploads', express.static(UPLOADS_DIR, { maxAge: '7d' }));
-app.get(['/health', '/api/health'], (_req, res) => res.json({ ok: true, version: 2 }));
+if (fs.existsSync(UPLOADS_DIR)) app.use('/uploads', express.static(UPLOADS_DIR, { maxAge: '7d' }));   // photos uploaded before the MySQL version
+const safe = safeApp(app);
+
+// Photos are stored in MySQL
+safe.get('/media/:id', async (req, res) => {
+  const m = /^\d+$/.test(req.params.id) ? await db.prepare('SELECT mime, data FROM media WHERE id=?').get(Number(req.params.id)) : null;
+  if (!m) return res.status(404).json({ error: 'Photo not found.' });
+  res.set({ 'Content-Type': m.mime, 'Cache-Control': 'public, max-age=31536000, immutable', 'X-Content-Type-Options': 'nosniff' });
+  if (m.mime === 'image/svg+xml') res.set('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; sandbox");
+  res.send(m.data);
+});
+safe.get(['/health', '/api/health'], async (_req, res) => {
+  try { await pool.query('SELECT 1'); res.json({ ok: true, version: 2, db: 'mysql' }); } catch { res.status(503).json({ ok: false, db: 'down' }); }
+});
 
 registerRoutes(app);
 registerAdmin(app);
@@ -49,10 +65,10 @@ if (dist) {
   app.get('/', (_req, res) => res.type('text').send('SellBuyAnywhere API is running. The website build was not found: copy client/dist into server/public and redeploy.'));
 }
 app.use((err, _req, res, _next) => {
-  if (err.status !== 503) console.error(err);
+  if (err.status !== 503 && !String(err.code || '').startsWith('LIMIT_')) console.error(err);
   res.status(err.status || (String(err.code || '').startsWith('LIMIT_') ? 400 : 500)).json({ error: err.status === 503 ? err.message : err.code === 'LIMIT_FILE_SIZE' ? 'That photo is too large (5 MB maximum).' : err.code === 'LIMIT_UNEXPECTED_FILE' ? 'You can upload up to 6 photos.' : 'Something went wrong on our side. Try again.' });
 });
 
-const server = app.listen(PORT, '0.0.0.0', () => console.log(`SellBuyAnywhere running on http://localhost:${PORT}`));
+const server = app.listen(PORT, '0.0.0.0', () => console.log(`SellBuyAnywhere running on http://localhost:${PORT} (MySQL)`));
 attachVoiceSocket(server);
 startBackups();

@@ -185,7 +185,7 @@ export async function aiAssistant(history, l, settings) {
   if (words.length) {
     const where = words.map(() => '(l.title LIKE ? OR l.description LIKE ? OR l.category LIKE ?)').join(' OR ');
     const args = words.flatMap((w) => [`%${w}%`, `%${w}%`, `%${w}%`]);
-    found = db.prepare(`SELECT l.id,l.title,l.price,l.city FROM listings l WHERE l.status='active' AND (${where}) ORDER BY l.id DESC LIMIT 5`).all(...args);
+    found = (await db.prepare(`SELECT l.id,l.title,l.price,l.city FROM listings l WHERE l.status='active' AND (${where}) ORDER BY l.id DESC LIMIT 5`).all(...args));
   }
   const ctx = found.length ? found.map((x) => `#${x.id} ${x.title}, Rs ${x.price}, ${x.city}`).join('\n') : 'none';
   const reply = await aiChat({ maxTokens: 400, temperature: 0.4,

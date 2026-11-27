@@ -3,8 +3,7 @@ import rateLimit from 'express-rate-limit';
 import jwt from 'jsonwebtoken';
 import multer from 'multer';
 import crypto from 'crypto';
-import path from 'path';
-import { db, UPLOADS_DIR } from './db.js';
+import { db, addMedia, removeMedia } from './db.js';
 import { JWT_SECRET } from './config.js';
 
 export const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -29,27 +28,31 @@ export async function sendMail(to, subject, text) {
 }
 
 // ---- Auth ----
-const lookup = (req) => {
+const lookup = async (req) => {
   try {
     const p = jwt.verify((req.headers.authorization || '').replace('Bearer ', ''), JWT_SECRET);
-    const u = db.prepare('SELECT id,email,role,status,name,phone FROM users WHERE id = ?').get(p.id);
+    const u = await db.prepare('SELECT id,email,role,status,name,phone FROM users WHERE id = ?').get(p.id);
     return u && u.status !== 'blocked' ? u : null;
   } catch { return null; }
 };
-export function auth(req, res, next) {
-  const u = lookup(req);
+export async function auth(req, res, next) {
+  const u = await lookup(req);
   if (!u) return res.status(401).json({ error: 'Please sign in to continue.' });
   req.user = u; next();
 }
-export function optAuth(req, _res, next) { req.user = lookup(req); next(); }
+export async function optAuth(req, _res, next) { req.user = await lookup(req); next(); }
 export const adminOnly = [auth, (req, res, next) => (req.user.role === 'admin' ? next() : res.status(403).json({ error: 'Admins only.' }))];
 export const signToken = (u) => jwt.sign({ id: u.id, email: u.email }, JWT_SECRET, { expiresIn: '30d' });
 
-// ---- Uploads ----
+// ---- Uploads: kept in memory, then stored in MySQL (media table) so photos survive publishes ----
 const imageOnly = (_req, file, cb) => cb(null, /^image\/(jpeg|png|webp|gif)$/.test(file.mimetype));
-export const upload = multer({
-  storage: multer.diskStorage({ destination: UPLOADS_DIR,
-    filename: (_r, f, cb) => cb(null, crypto.randomBytes(12).toString('hex') + path.extname(f.originalname).toLowerCase()) }),
-  limits: { fileSize: 5 * 1024 * 1024 }, fileFilter: imageOnly,
-});
+export const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 }, fileFilter: imageOnly });
 export const memUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 4 * 1024 * 1024 }, fileFilter: imageOnly });
+export async function saveImages(files) { const urls = []; for (const f of files) urls.push(await addMedia(f.mimetype, f.buffer)); return urls; }
+export { removeMedia };
+
+// Express 4 does not catch errors from async handlers; this wraps every handler so a failed database call returns a clean 500.
+const wrapH = (h) => (req, res, next) => { try { const r = h(req, res, next); if (r && typeof r.catch === 'function') r.catch(next); } catch (e) { next(e); } };
+export const safeApp = (app) => new Proxy(app, { get(t, k) {
+  if (['get', 'post', 'put', 'patch', 'delete'].includes(k)) return (path, ...hs) => t[k](path, ...hs.map(wrapH));
+  const v = t[k]; return typeof v === 'function' ? v.bind(t) : v; } });

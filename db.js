@@ -1,4 +1,6 @@
-import Database from 'better-sqlite3';
+// MySQL data layer. All live data (including photos) is stored in MySQL, so publishing new code can never wipe it.
+// Connection: MYSQL_URL=mysql://user:pass@host:3306/dbname   or   MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE   (MYSQL_SSL=true for hosted databases that need TLS)
+import mysql from 'mysql2/promise';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
@@ -9,97 +11,95 @@ import { DEFAULT_PAGES } from './pages-default.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const APP_DIR = __dirname;
-
-// ---- Where live data is kept ----
-// A publish/deploy replaces the code folder with a fresh copy of the project, including any data/ folder inside it. That is what was
-// wiping live data. So live data now lives OUTSIDE the code folder (next to it, or in the home folder). DATA_DIR / UPLOADS_DIR override this.
-function pickBase() {
+export const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(__dirname, 'uploads');   // only used to serve photos uploaded before the MySQL version
+function pickBackupDir() {
+  if (process.env.BACKUP_DIR) return process.env.BACKUP_DIR;
   for (const base of [path.resolve(__dirname, '..'), os.homedir()]) {
-    try { const d = path.join(base, 'sba-data'); fs.mkdirSync(d, { recursive: true }); fs.accessSync(d, fs.constants.W_OK); return d; } catch { /* try the next place */ }
+    try { const d = path.join(base, 'sba-backups'); fs.mkdirSync(d, { recursive: true }); fs.accessSync(d, fs.constants.W_OK); return d; } catch { /* next */ }
   }
-  return path.join(__dirname, 'storage');                        // last resort: inside the code folder (not safe from deploys)
+  return path.join(__dirname, 'backups');
 }
-const BASE = pickBase();
-export const DATA_DIR = process.env.DATA_DIR || path.join(BASE, 'data');
-export const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(BASE, 'uploads');
-export const BACKUP_DIR = process.env.BACKUP_DIR || path.join(BASE, 'backups');
-fs.mkdirSync(DATA_DIR, { recursive: true });
-fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+export const BACKUP_DIR = pickBackupDir();
 
-// One-time move of data from the old location (./data, ./uploads inside the code folder) to the safe location.
-const LEGACY_DB = path.join(__dirname, 'data', 'sba.db');
-if (!fs.existsSync(path.join(DATA_DIR, 'sba.db')) && fs.existsSync(LEGACY_DB) && path.resolve(DATA_DIR) !== path.resolve(__dirname, 'data')) {
-  try {
-    const old = new Database(LEGACY_DB, { readonly: false });
-    old.exec(`VACUUM INTO '${path.join(DATA_DIR, 'sba.db').replace(/'/g, "''")}'`);
-    old.close();
-    const lu = path.join(__dirname, 'uploads');
-    if (fs.existsSync(lu)) fs.cpSync(lu, UPLOADS_DIR, { recursive: true });
-    console.log(`Moved existing data to ${DATA_DIR}`);
-  } catch (e) { console.error('Could not move old data:', e.message); }
+function poolConfig() {
+  let c = { host: process.env.MYSQL_HOST || 'localhost', port: Number(process.env.MYSQL_PORT || 3306), user: process.env.MYSQL_USER, password: process.env.MYSQL_PASSWORD, database: process.env.MYSQL_DATABASE };
+  const url = process.env.MYSQL_URL || process.env.DATABASE_URL;
+  if (url) { const u = new URL(url); c = { host: u.hostname, port: Number(u.port || 3306), user: decodeURIComponent(u.username), password: decodeURIComponent(u.password), database: u.pathname.slice(1) }; }
+  return { ...c, charset: 'utf8mb4', timezone: 'Z', dateStrings: true, waitForConnections: true, connectionLimit: 10, connectTimeout: 15000,
+    ssl: process.env.MYSQL_SSL === 'true' ? { rejectUnauthorized: false } : undefined };
 }
-export const db = new Database(path.join(DATA_DIR, 'sba.db'));
-db.pragma('journal_mode = WAL');
+export const pool = mysql.createPool(poolConfig());
+pool.pool.on('connection', (c) => c.query("SET time_zone = '+00:00'"));       // every time is stored and compared in UTC
 
-db.exec(`
-CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
-  role TEXT DEFAULT 'user', name TEXT DEFAULT '', phone TEXT DEFAULT '', status TEXT DEFAULT 'active', created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS shops (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, name TEXT NOT NULL, city TEXT NOT NULL,
-  phone TEXT NOT NULL, address TEXT DEFAULT '', description TEXT DEFAULT '', plan TEXT DEFAULT 'basic', status TEXT DEFAULT 'active',
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, name_te TEXT DEFAULT '', icon TEXT DEFAULT '🎁', sort INTEGER DEFAULT 0, active INTEGER DEFAULT 1);
-CREATE TABLE IF NOT EXISTS cities (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, name_te TEXT DEFAULT '', state TEXT DEFAULT '', sort INTEGER DEFAULT 0, active INTEGER DEFAULT 1);
-CREATE TABLE IF NOT EXISTS listings (id INTEGER PRIMARY KEY, user_id INTEGER, shop_id INTEGER, title TEXT NOT NULL, description TEXT DEFAULT '',
-  price INTEGER NOT NULL DEFAULT 0, category TEXT DEFAULT 'Others', city TEXT NOT NULL, phone TEXT DEFAULT '', image TEXT DEFAULT '', images TEXT DEFAULT '[]',
-  featured_until TEXT, status TEXT DEFAULT 'active', views INTEGER DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-CREATE INDEX IF NOT EXISTS idx_listings_city ON listings(city);
-CREATE INDEX IF NOT EXISTS idx_listings_shop ON listings(shop_id);
-CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, order_id TEXT UNIQUE NOT NULL, payment_id TEXT, user_id INTEGER,
-  amount INTEGER DEFAULT 0, status TEXT DEFAULT 'created', meta TEXT DEFAULT '{}', created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS ads (id INTEGER PRIMARY KEY, slot TEXT NOT NULL, title TEXT NOT NULL, image TEXT DEFAULT '', link TEXT NOT NULL, active INTEGER DEFAULT 1);
-CREATE TABLE IF NOT EXISTS calls (id INTEGER PRIMARY KEY, product_id INTEGER, shop_id INTEGER, phone TEXT NOT NULL, status TEXT DEFAULT 'queued',
-  call_sid TEXT, note TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS pages (slug TEXT PRIMARY KEY, title TEXT, title_te TEXT DEFAULT '', body TEXT, body_te TEXT DEFAULT '', updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, name TEXT, email TEXT, phone TEXT DEFAULT '', subject TEXT DEFAULT '', message TEXT, status TEXT DEFAULT 'new', created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS reports (id INTEGER PRIMARY KEY, listing_id INTEGER, reason TEXT, status TEXT DEFAULT 'open', created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
-`);
+// Small helper API: db.prepare(sql).get / all / run  (always async), db.transaction(async (tx) => ...)
+const api = (conn) => ({
+  prepare: (sql) => ({
+    get: async (...p) => (await conn.query(sql, p))[0][0],
+    all: async (...p) => (await conn.query(sql, p))[0],
+    run: async (...p) => { const r = (await conn.query(sql, p))[0]; return { lastInsertRowid: r.insertId, changes: r.affectedRows }; },
+  }),
+  exec: async (sql) => (await conn.query(sql))[0],
+});
+export const db = {
+  ...api(pool),
+  transaction: async (fn) => {
+    const c = await pool.getConnection();
+    try { await c.beginTransaction(); const r = await fn(api(c)); await c.commit(); return r; }
+    catch (e) { await c.rollback(); throw e; }
+    finally { c.release(); }
+  },
+};
 
-// ---- Migration from the first version (products table) ----
-function addCol(table, col, def) {
-  if (!db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+// ---- Photos live in MySQL too ----
+export async function addMedia(mime, buffer) {
+  const [r] = await pool.execute('INSERT INTO media (mime, data) VALUES (?, ?)', [mime, buffer]);
+  return `/media/${r.insertId}`;
 }
-addCol('users', 'role', "TEXT DEFAULT 'user'"); addCol('users', 'name', "TEXT DEFAULT ''");
-addCol('users', 'phone', "TEXT DEFAULT ''"); addCol('users', 'status', "TEXT DEFAULT 'active'");
-addCol('listings', 'images', "TEXT DEFAULT '[]'"); addCol('cities', 'lat', 'REAL'); addCol('cities', 'lng', 'REAL');
-addCol('shops', 'description', "TEXT DEFAULT ''"); addCol('shops', 'status', "TEXT DEFAULT 'active'");
-if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='products'").get() && !db.prepare('SELECT 1 FROM listings LIMIT 1').get()) {
-  db.exec(`INSERT INTO listings (id,user_id,shop_id,title,description,price,category,city,phone,image,created_at)
-    SELECT p.id, s.user_id, p.shop_id, p.title, p.description, p.price, p.category, p.city, s.phone, p.image, p.created_at
-    FROM products p JOIN shops s ON s.id = p.shop_id`);
-  db.exec('ALTER TABLE products RENAME TO products_old');
+export async function removeMedia(urls) {
+  const ids = urls.map((u) => /^\/media\/(\d+)$/.exec(u)?.[1]).filter(Boolean).map(Number);
+  if (ids.length) await pool.query('DELETE FROM media WHERE id IN (?)', [ids]);
 }
-db.exec("UPDATE users SET role='user' WHERE role IS NULL OR role='owner'");
 
-// ---- Default categories, cities and pages (inserted once; admin edits are kept) ----
+const T = 'ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci';
+const SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS users (id INT AUTO_INCREMENT PRIMARY KEY, email VARCHAR(190) NOT NULL UNIQUE, password_hash VARCHAR(100) NOT NULL, role VARCHAR(20) NOT NULL DEFAULT 'user',
+    name VARCHAR(120) NOT NULL DEFAULT '', phone VARCHAR(30) NOT NULL DEFAULT '', status VARCHAR(20) NOT NULL DEFAULT 'active', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP) ${T}`,
+  `CREATE TABLE IF NOT EXISTS shops (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT NOT NULL, name VARCHAR(160) NOT NULL, city VARCHAR(80) NOT NULL, phone VARCHAR(30) NOT NULL,
+    address VARCHAR(400) NOT NULL DEFAULT '', description VARCHAR(600) NOT NULL DEFAULT '', plan VARCHAR(20) NOT NULL DEFAULT 'basic', status VARCHAR(20) NOT NULL DEFAULT 'active',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, KEY idx_shop_user (user_id), KEY idx_shop_city (city)) ${T}`,
+  `CREATE TABLE IF NOT EXISTS categories (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL UNIQUE, name_te VARCHAR(120) NOT NULL DEFAULT '', icon VARCHAR(20) NOT NULL DEFAULT '🎁',
+    sort INT NOT NULL DEFAULT 0, active TINYINT(1) NOT NULL DEFAULT 1) ${T}`,
+  `CREATE TABLE IF NOT EXISTS cities (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL UNIQUE, name_te VARCHAR(120) NOT NULL DEFAULT '', state VARCHAR(60) NOT NULL DEFAULT '',
+    lat DOUBLE NULL, lng DOUBLE NULL, sort INT NOT NULL DEFAULT 0, active TINYINT(1) NOT NULL DEFAULT 1) ${T}`,
+  `CREATE TABLE IF NOT EXISTS listings (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT NULL, shop_id INT NULL, title VARCHAR(160) NOT NULL, description TEXT NULL, price BIGINT NOT NULL DEFAULT 0,
+    category VARCHAR(80) NOT NULL DEFAULT 'Others', city VARCHAR(80) NOT NULL, phone VARCHAR(30) NOT NULL DEFAULT '', image VARCHAR(255) NOT NULL DEFAULT '', images TEXT NULL,
+    buy_url VARCHAR(600) NOT NULL DEFAULT '', featured_until DATETIME NULL, status VARCHAR(20) NOT NULL DEFAULT 'active', views INT NOT NULL DEFAULT 0,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, KEY idx_l_city (city), KEY idx_l_shop (shop_id), KEY idx_l_user (user_id), KEY idx_l_status (status), KEY idx_l_feat (featured_until)) ${T}`,
+  `CREATE TABLE IF NOT EXISTS payments (id INT AUTO_INCREMENT PRIMARY KEY, kind VARCHAR(20) NOT NULL, order_id VARCHAR(100) NOT NULL UNIQUE, payment_id VARCHAR(100) NULL, user_id INT NULL,
+    amount INT NOT NULL DEFAULT 0, status VARCHAR(20) NOT NULL DEFAULT 'created', meta TEXT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP) ${T}`,
+  `CREATE TABLE IF NOT EXISTS ads (id INT AUTO_INCREMENT PRIMARY KEY, slot VARCHAR(40) NOT NULL, title VARCHAR(160) NOT NULL, image VARCHAR(255) NOT NULL DEFAULT '', link VARCHAR(600) NOT NULL, active TINYINT(1) NOT NULL DEFAULT 1) ${T}`,
+  `CREATE TABLE IF NOT EXISTS calls (id INT AUTO_INCREMENT PRIMARY KEY, product_id INT NULL, shop_id INT NULL, phone VARCHAR(30) NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'queued',
+    call_sid VARCHAR(100) NULL, note VARCHAR(255) NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, KEY idx_c_phone (phone), KEY idx_c_sid (call_sid)) ${T}`,
+  `CREATE TABLE IF NOT EXISTS pages (slug VARCHAR(60) NOT NULL PRIMARY KEY, title VARCHAR(200) NOT NULL, title_te VARCHAR(200) NOT NULL DEFAULT '', body MEDIUMTEXT NOT NULL, body_te MEDIUMTEXT NULL,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP) ${T}`,
+  `CREATE TABLE IF NOT EXISTS messages (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(120) NOT NULL, email VARCHAR(190) NOT NULL, phone VARCHAR(30) NOT NULL DEFAULT '', subject VARCHAR(200) NOT NULL DEFAULT '',
+    message TEXT NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'new', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP) ${T}`,
+  `CREATE TABLE IF NOT EXISTS reports (id INT AUTO_INCREMENT PRIMARY KEY, listing_id INT NOT NULL, reason VARCHAR(600) NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'open', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP) ${T}`,
+  `CREATE TABLE IF NOT EXISTS settings (skey VARCHAR(100) NOT NULL PRIMARY KEY, svalue TEXT NULL) ${T}`,
+  `CREATE TABLE IF NOT EXISTS media (id INT AUTO_INCREMENT PRIMARY KEY, mime VARCHAR(60) NOT NULL, data MEDIUMBLOB NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP) ${T}`,
+];
+
 const CATS = [['Electronics', 'ఎలక్ట్రానిక్స్', '📱'], ['Vehicles', 'వాహనాలు', '🚗'], ['Furniture', 'ఫర్నిచర్', '🛋️'], ['Fashion', 'ఫ్యాషన్', '👗'],
   ['Jobs', 'ఉద్యోగాలు', '💼'], ['Real Estate', 'ఇళ్లు & స్థలాలు', '🏠'], ['Services', 'సేవలు', '🔧'], ['Books', 'పుస్తకాలు', '📚'],
   ['Sports', 'క్రీడలు', '⚽'], ['Others', 'ఇతరాలు', '🎁']];
-CATS.forEach(([n, te, ic], i) => db.prepare('INSERT OR IGNORE INTO categories (name,name_te,icon,sort) VALUES (?,?,?,?)').run(n, te, ic, i));
-const CITIES = [['Hyderabad', 'హైదరాబాద్', 'Telangana'], ['Vijayawada', 'విజయవాడ', 'Andhra Pradesh'], ['Visakhapatnam', 'విశాఖపట్నం', 'Andhra Pradesh'],
-  ['Warangal', 'వరంగల్', 'Telangana'], ['Guntur', 'గుంటూరు', 'Andhra Pradesh'], ['Tirupati', 'తిరుపతి', 'Andhra Pradesh'], ['Nellore', 'నెల్లూరు', 'Andhra Pradesh'],
-  ['Karimnagar', 'కరీంనగర్', 'Telangana'], ['Kakinada', 'కాకినాడ', 'Andhra Pradesh'], ['Rajahmundry', 'రాజమండ్రి', 'Andhra Pradesh'], ['Kurnool', 'కర్నూలు', 'Andhra Pradesh'],
-  ['Bengaluru', 'బెంగళూరు', 'Karnataka'], ['Chennai', 'చెన్నై', 'Tamil Nadu'], ['Mumbai', 'ముంబై', 'Maharashtra'], ['Delhi', 'ఢిల్లీ', 'Delhi'],
-  ['Pune', 'పుణె', 'Maharashtra'], ['Kolkata', 'కోల్‌కతా', 'West Bengal']];
-CITIES.forEach(([n, te, st], i) => db.prepare('INSERT OR IGNORE INTO cities (name,name_te,state,sort) VALUES (?,?,?,?)').run(n, te, st, i));
-const COORDS = { Hyderabad: [17.385, 78.4867], Vijayawada: [16.5062, 80.648], Visakhapatnam: [17.6868, 83.2185], Warangal: [17.9689, 79.5941], Guntur: [16.3067, 80.4365],
-  Tirupati: [13.6288, 79.4192], Nellore: [14.4426, 79.9865], Karimnagar: [18.4392, 79.1288], Kakinada: [16.9891, 82.2475], Rajahmundry: [17.0005, 81.804], Kurnool: [15.8281, 78.0373],
-  Bengaluru: [12.9716, 77.5946], Chennai: [13.0827, 80.2707], Mumbai: [19.076, 72.8777], Delhi: [28.6139, 77.209], Pune: [18.5204, 73.8567], Kolkata: [22.5726, 88.3639] };
-for (const [n, [la, lo]] of Object.entries(COORDS)) db.prepare('UPDATE cities SET lat=?, lng=? WHERE name=? AND lat IS NULL').run(la, lo, n);
-for (const [slug, p] of Object.entries(DEFAULT_PAGES))
-  db.prepare('INSERT OR IGNORE INTO pages (slug,title,title_te,body) VALUES (?,?,?,?)').run(slug, p.title, p.title_te, p.body);
+const CITIES = [['Hyderabad', 'హైదరాబాద్', 'Telangana', 17.385, 78.4867], ['Vijayawada', 'విజయవాడ', 'Andhra Pradesh', 16.5062, 80.648], ['Visakhapatnam', 'విశాఖపట్నం', 'Andhra Pradesh', 17.6868, 83.2185],
+  ['Warangal', 'వరంగల్', 'Telangana', 17.9689, 79.5941], ['Guntur', 'గుంటూరు', 'Andhra Pradesh', 16.3067, 80.4365], ['Tirupati', 'తిరుపతి', 'Andhra Pradesh', 13.6288, 79.4192],
+  ['Nellore', 'నెల్లూరు', 'Andhra Pradesh', 14.4426, 79.9865], ['Karimnagar', 'కరీంనగర్', 'Telangana', 18.4392, 79.1288], ['Kakinada', 'కాకినాడ', 'Andhra Pradesh', 16.9891, 82.2475],
+  ['Rajahmundry', 'రాజమండ్రి', 'Andhra Pradesh', 17.0005, 81.804], ['Kurnool', 'కర్నూలు', 'Andhra Pradesh', 15.8281, 78.0373], ['Bengaluru', 'బెంగళూరు', 'Karnataka', 12.9716, 77.5946],
+  ['Chennai', 'చెన్నై', 'Tamil Nadu', 13.0827, 80.2707], ['Mumbai', 'ముంబై', 'Maharashtra', 19.076, 72.8777], ['Delhi', 'ఢిల్లీ', 'Delhi', 28.6139, 77.209],
+  ['Pune', 'పుణె', 'Maharashtra', 18.5204, 73.8567], ['Kolkata', 'కోల్‌కతా', 'West Bengal', 22.5726, 88.3639]];
 
-// ---- Settings (secrets are encrypted in the database; environment variables are the fallback) ----
+// ---- Settings: cached in memory (so getSetting stays synchronous); secrets are encrypted in the database ----
 export const DEFAULTS = {
   site_name: 'SellBuyAnywhere', support_email: 'support@sellbuyanywhere.com', support_phone: '', address: '',
   promo_active: 'yes', promo_shop_price: '1', promo_title: 'Launch offer',
@@ -118,19 +118,22 @@ const enc = (t) => { const iv = crypto.randomBytes(12); const c = crypto.createC
   return 'enc:' + [iv, c.getAuthTag(), d].map((b) => b.toString('base64')).join(':'); };
 const dec = (v) => { try { const [iv, tag, d] = v.slice(4).split(':').map((x) => Buffer.from(x, 'base64'));
   const c = crypto.createDecipheriv('aes-256-gcm', KEY, iv); c.setAuthTag(tag); return Buffer.concat([c.update(d), c.final()]).toString('utf8'); } catch { return ''; } };
+const cache = new Map();
+export async function loadSettings() { cache.clear(); for (const r of await db.prepare('SELECT skey, svalue FROM settings').all()) cache.set(r.skey, r.svalue ?? ''); }
 export function getSetting(k) {
-  const r = db.prepare('SELECT value FROM settings WHERE key = ?').get(k);
-  if (r && r.value !== '') return SECRET_KEYS.has(k) ? dec(r.value) : r.value;
+  const v = cache.get(k);
+  if (v !== undefined && v !== '') return SECRET_KEYS.has(k) ? dec(v) : v;
   return process.env[k.toUpperCase()] ?? DEFAULTS[k] ?? '';
 }
-export function setSetting(k, v) {
-  db.prepare('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
-    .run(k, v === '' ? '' : SECRET_KEYS.has(k) ? enc(String(v)) : String(v));
+export async function setSetting(k, v) {
+  const stored = v === '' ? '' : SECRET_KEYS.has(k) ? enc(String(v)) : String(v);
+  await db.prepare('INSERT INTO settings (skey, svalue) VALUES (?, ?) ON DUPLICATE KEY UPDATE svalue = VALUES(svalue)').run(k, stored);
+  cache.set(k, stored);
 }
 export const wsKey = () => crypto.createHmac('sha256', JWT_SECRET).update('voicebot-ws').digest('hex').slice(0, 24);
 
-export function resolvePage(slug, lang = 'en') {
-  const p = db.prepare('SELECT * FROM pages WHERE slug = ?').get(slug);
+export async function resolvePage(slug, lang = 'en') {
+  const p = await db.prepare('SELECT * FROM pages WHERE slug = ?').get(slug);
   if (!p) return null;
   const vars = { site: getSetting('site_name'), email: getSetting('support_email'), phone: getSetting('support_phone') ? 'Phone: ' + getSetting('support_phone') : '',
     address: getSetting('address'), premium_price: getSetting('premium_price'), premium_days: getSetting('premium_days') };
@@ -139,7 +142,19 @@ export function resolvePage(slug, lang = 'en') {
   return { slug, title: fill((te && p.title_te) || p.title), body: fill((te && p.body_te) || p.body), translated: te && !!p.body_te };
 }
 
-// ---- Storage bookkeeping: lets the admin see if data is being reset (creation date / restart count go back each publish) ----
-if (!db.prepare("SELECT 1 FROM settings WHERE key='db_created_at'").get()) setSetting('db_created_at', new Date().toISOString());
-setSetting('boots', String((Number(getSetting('boots')) || 0) + 1));
-setSetting('last_boot_at', new Date().toISOString());
+// ---- Start-up: connect, create tables, insert defaults once, load settings ----
+export async function initDb() {
+  try { await pool.query('SELECT 1'); }
+  catch (e) { throw new Error(`Cannot connect to MySQL (${e.code || e.message}). Set MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD and MYSQL_DATABASE (or MYSQL_URL) in the environment settings.`); }
+  for (const sql of SCHEMA) await db.exec(sql);
+  for (const [i, [n, te, ic]] of CATS.entries()) await db.prepare('INSERT IGNORE INTO categories (name,name_te,icon,sort) VALUES (?,?,?,?)').run(n, te, ic, i);
+  for (const [i, [n, te, st, la, lo]] of CITIES.entries()) {
+    await db.prepare('INSERT IGNORE INTO cities (name,name_te,state,lat,lng,sort) VALUES (?,?,?,?,?,?)').run(n, te, st, la, lo, i);
+    await db.prepare('UPDATE cities SET lat=?, lng=? WHERE name=? AND lat IS NULL').run(la, lo, n);
+  }
+  for (const [slug, p] of Object.entries(DEFAULT_PAGES)) await db.prepare('INSERT IGNORE INTO pages (slug,title,title_te,body) VALUES (?,?,?,?)').run(slug, p.title, p.title_te, p.body);
+  await loadSettings();
+  if (!(await db.prepare("SELECT 1 x FROM settings WHERE skey='db_created_at'").get())) await setSetting('db_created_at', new Date().toISOString());
+  await setSetting('boots', String((Number(getSetting('boots')) || 0) + 1));
+  await setSetting('last_boot_at', new Date().toISOString());
+}
